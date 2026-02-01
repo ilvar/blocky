@@ -96,6 +96,8 @@ type BlockingResolver struct {
 	clientGroupsBlock   map[string][]string
 	redisClient         *redis.Client
 	fqdnIPCache         cache.ExpiringCache[[]net.IP]
+	parentalControl     *config.ParentalControl
+	timeLocation        *time.Location
 }
 
 func clientGroupsBlock(cfg config.Blocking) map[string][]string {
@@ -118,6 +120,7 @@ func clientGroupsBlock(cfg config.Blocking) map[string][]string {
 // NewBlockingResolver returns a new configured instance of the resolver
 func NewBlockingResolver(ctx context.Context,
 	cfg config.Blocking,
+	parentalControl config.ParentalControl,
 	redis *redis.Client,
 	bootstrap *Bootstrap,
 ) (r *BlockingResolver, err error) {
@@ -139,6 +142,22 @@ func NewBlockingResolver(ctx context.Context,
 		return nil, fmt.Errorf("failed to create denylist/allowlist cache: %w", err)
 	}
 
+	// Parse timezone for parental control
+	var timeLocation *time.Location
+
+	if parentalControl.IsEnabled() {
+		if parentalControl.Timezone != "" {
+			loc, locErr := time.LoadLocation(parentalControl.Timezone)
+			if locErr != nil {
+				return nil, fmt.Errorf("invalid timezone '%s': %w", parentalControl.Timezone, locErr)
+			}
+
+			timeLocation = loc
+		} else {
+			timeLocation = time.Local
+		}
+	}
+
 	res := &BlockingResolver{
 		configurable: withConfig(&cfg),
 		typed:        withType("blocking"),
@@ -153,6 +172,8 @@ func NewBlockingResolver(ctx context.Context,
 		},
 		clientGroupsBlock: clientGroupsBlock(cfg),
 		redisClient:       redis,
+		parentalControl:   &parentalControl,
+		timeLocation:      timeLocation,
 	}
 
 	res.fqdnIPCache = expirationcache.NewCacheWithOnExpired[[]net.IP](ctx, expirationcache.Options{
@@ -354,12 +375,80 @@ func (r *BlockingResolver) LogConfig(logger *logrus.Entry) {
 
 	logger.Info("allowlist cache entries:")
 	log.WithIndent(logger, "  ", r.allowlistMatcher.LogConfig)
+
+	if r.parentalControl.IsEnabled() {
+		logger.Info("parental control:")
+		log.WithIndent(logger, "  ", r.parentalControl.LogConfig)
+	}
 }
 
 func (r *BlockingResolver) hasAllowlistOnlyAllowed(groupsToCheck []string) bool {
 	for _, group := range groupsToCheck {
 		if _, found := r.allowlistOnlyGroups[group]; found {
 			return true
+		}
+	}
+
+	return false
+}
+
+// getScheduledAction checks if any parental control schedule is active for the client
+func (r *BlockingResolver) getScheduledAction(request *model.Request, currentTime time.Time) (
+	action config.ScheduleAction,
+	groups []string,
+	matched bool,
+) {
+	if !r.parentalControl.IsEnabled() {
+		return config.ScheduleActionBlockGroups, nil, false
+	}
+
+	// Check each client identifier in the parental control config
+	for clientIdentifier, schedules := range r.parentalControl.Clients {
+		if !r.clientMatchesIdentifier(request, clientIdentifier) {
+			continue
+		}
+
+		// Check each schedule for this client
+		for _, schedule := range schedules {
+			for _, window := range schedule.Schedule {
+				if window.IsActive(currentTime) {
+					return schedule.Action, schedule.Groups, true
+				}
+			}
+		}
+	}
+
+	return config.ScheduleActionBlockGroups, nil, false
+}
+
+// clientMatchesIdentifier checks if a request matches a client identifier
+func (r *BlockingResolver) clientMatchesIdentifier(request *model.Request, identifier string) bool {
+	// Try matching by client name (supports wildcards)
+	for _, cName := range request.ClientNames {
+		if util.ClientNameMatchesGroupName(identifier, cName) {
+			return true
+		}
+	}
+
+	// Try exact IP match
+	if request.ClientIP.String() == identifier {
+		return true
+	}
+
+	// Try CIDR match
+	if util.CidrContainsIP(identifier, request.ClientIP) {
+		return true
+	}
+
+	// Try FQDN match via cache
+	if isFQDN(identifier) && r.fqdnIPCache != nil {
+		ips, _ := r.fqdnIPCache.Get(identifier)
+		if ips != nil {
+			for _, ip := range *ips {
+				if ip.Equal(request.ClientIP) {
+					return true
+				}
+			}
 		}
 	}
 
@@ -409,6 +498,41 @@ func (r *BlockingResolver) handleDenylist(ctx context.Context, groupsToCheck []s
 // Resolve checks the query against the denylist and delegates to next resolver if domain is not blocked
 func (r *BlockingResolver) Resolve(ctx context.Context, request *model.Request) (*model.Response, error) {
 	ctx, logger := r.log(ctx)
+
+	// Check parental control first
+	if r.parentalControl.IsEnabled() {
+		currentTime := time.Now().In(r.timeLocation)
+		action, pcGroups, matched := r.getScheduledAction(request, currentTime)
+
+		if matched {
+			switch action {
+			case config.ScheduleActionBlockAll:
+				// Block all DNS requests during this window
+				return r.handleBlocked(logger, request, request.Req.Question[0], "BLOCKED (PARENTAL CONTROL)")
+
+			case config.ScheduleActionAllowGroupsOnly:
+				// Only allow domains matching specified allowlist groups
+				for _, question := range request.Req.Question {
+					domain := util.ExtractDomain(question)
+					if groups := r.matches(pcGroups, r.allowlistMatcher, domain); len(groups) > 0 {
+						logger.WithField("groups", groups).Debugf("domain allowed by parental control allowlist")
+						// Continue to normal resolution
+						break
+					}
+					// Not in allowlist, block it
+					return r.handleBlocked(logger, request, question, "BLOCKED (PARENTAL CONTROL - NOT IN ALLOWLIST)")
+				}
+
+			case config.ScheduleActionBlockGroups:
+				// Add specified groups to blocking check
+				handled, resp, err := r.handleDenylist(ctx, pcGroups, request, logger)
+				if handled {
+					return resp, err
+				}
+			}
+		}
+	}
+
 	groupsToCheck := r.groupsToCheckForClient(request)
 
 	if len(groupsToCheck) > 0 {

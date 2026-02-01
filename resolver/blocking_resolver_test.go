@@ -26,6 +26,19 @@ var (
 	tmpDir                                   *TmpFolder
 )
 
+// Helper functions for creating DayPattern in tests
+func dayPatternEveryday() config.DayPattern {
+	var d config.DayPattern
+	_ = d.UnmarshalText([]byte("everyday"))
+
+	return d
+}
+
+func dayPatternNone() config.DayPattern {
+	// Returns an empty day pattern that won't match any day
+	return config.DayPattern{}
+}
+
 var _ = BeforeSuite(func() {
 	tmpDir = NewTmpFolder("BlockingResolver")
 	group1File = tmpDir.CreateStringFile("group1File", "DOMAIN1.com")
@@ -71,7 +84,7 @@ var _ = Describe("BlockingResolver", Label("blockingResolver"), func() {
 		m = &mockResolver{}
 		m.On("Resolve", mock.Anything).Return(&Response{Res: mockAnswer}, nil)
 
-		sut, err = NewBlockingResolver(ctx, sutConfig, nil, systemResolverBootstrap)
+		sut, err = NewBlockingResolver(ctx, sutConfig, config.ParentalControl{}, nil, systemResolverBootstrap)
 		Expect(err).Should(Succeed())
 		sut.Next(m)
 	})
@@ -112,7 +125,7 @@ var _ = Describe("BlockingResolver", Label("blockingResolver"), func() {
 				Expect(err).Should(Succeed())
 
 				// recreate to trigger a reload
-				sut, err = NewBlockingResolver(ctx, sutConfig, nil, systemResolverBootstrap)
+				sut, err = NewBlockingResolver(ctx, sutConfig, config.ParentalControl{}, nil, systemResolverBootstrap)
 				Expect(err).Should(Succeed())
 
 				Eventually(groupCnt, "1s").Should(HaveLen(2))
@@ -1145,7 +1158,7 @@ var _ = Describe("BlockingResolver", Label("blockingResolver"), func() {
 			It("should return error", func() {
 				_, err := NewBlockingResolver(ctx, config.Blocking{
 					BlockType: "wrong",
-				}, nil, systemResolverBootstrap)
+				}, config.ParentalControl{}, nil, systemResolverBootstrap)
 
 				Expect(err).Should(HaveOccurred())
 				Expect(err.Error()).Should(ContainSubstring(
@@ -1161,7 +1174,7 @@ var _ = Describe("BlockingResolver", Label("blockingResolver"), func() {
 						Init: config.Init{Strategy: config.InitStrategyFailOnError},
 					},
 					BlockType: "zeroIp",
-				}, nil, systemResolverBootstrap)
+				}, config.ParentalControl{}, nil, systemResolverBootstrap)
 				Expect(err).Should(HaveOccurred())
 			})
 		})
@@ -1190,7 +1203,7 @@ var _ = Describe("BlockingResolver", Label("blockingResolver"), func() {
 				BlockTTL:  config.Duration(time.Minute),
 			}
 
-			sut, err = NewBlockingResolver(ctx, sutConfig, redisClient, systemResolverBootstrap)
+			sut, err = NewBlockingResolver(ctx, sutConfig, config.ParentalControl{}, redisClient, systemResolverBootstrap)
 			Expect(err).Should(Succeed())
 		})
 		JustAfterEach(func() {
@@ -1237,6 +1250,273 @@ var _ = Describe("BlockingResolver", Label("blockingResolver"), func() {
 				Eventually(func() bool {
 					return sut.BlockingStatus().Enabled
 				}, "5s").Should(BeTrue())
+			})
+		})
+	})
+
+	Describe("Parental Control", func() {
+		var (
+			parentalConfig config.ParentalControl
+			socialMediaFile *TmpFile
+			educationFile   *TmpFile
+		)
+
+		BeforeEach(func() {
+			socialMediaFile = tmpDir.CreateStringFile("socialMedia", "facebook.com", "instagram.com", "tiktok.com")
+			educationFile = tmpDir.CreateStringFile("education", "wikipedia.org", "khanacademy.org")
+
+			sutConfig = config.Blocking{
+				BlockType: "ZEROIP",
+				BlockTTL:  config.Duration(time.Minute),
+				Denylists: map[string][]config.BytesSource{
+					"socialMedia": config.NewBytesSources(socialMediaFile.Path),
+				},
+				Allowlists: map[string][]config.BytesSource{
+					"education": config.NewBytesSources(educationFile.Path),
+				},
+			}
+		})
+
+		Describe("blockAll action", func() {
+			BeforeEach(func() {
+				// Create a schedule that is always active (everyday, all day)
+				parentalConfig = config.ParentalControl{
+					Clients: map[string][]config.ClientSchedule{
+						"192.168.1.100": {
+							{
+								Action: config.ScheduleActionBlockAll,
+								Schedule: []config.ScheduleWindow{
+									{
+										Start: config.TimeOfDay{Hour: 0, Minute: 0},
+										End:   config.TimeOfDay{Hour: 23, Minute: 59},
+										Days:  dayPatternEveryday(),
+									},
+								},
+							},
+						},
+					},
+				}
+			})
+
+			JustBeforeEach(func() {
+				var err error
+				m = &mockResolver{}
+				m.On("Resolve", mock.Anything).Return(&Response{Res: mockAnswer}, nil)
+
+				sut, err = NewBlockingResolver(ctx, sutConfig, parentalConfig, nil, systemResolverBootstrap)
+				Expect(err).Should(Succeed())
+				sut.Next(m)
+			})
+
+			It("should block all requests from matching client", func() {
+				Expect(sut.Resolve(ctx, newRequestWithClient("google.com.", A, "192.168.1.100", "client1"))).
+					Should(And(
+						BeDNSRecord("google.com.", A, "0.0.0.0"),
+						HaveResponseType(ResponseTypeBLOCKED),
+						HaveReason("BLOCKED (PARENTAL CONTROL)"),
+					))
+			})
+
+			It("should not block requests from non-matching client", func() {
+				Expect(sut.Resolve(ctx, newRequestWithClient("google.com.", A, "192.168.1.200", "client2"))).
+					Should(And(
+						HaveResponseType(ResponseTypeRESOLVED),
+					))
+			})
+		})
+
+		Describe("blockGroups action", func() {
+			BeforeEach(func() {
+				parentalConfig = config.ParentalControl{
+					Clients: map[string][]config.ClientSchedule{
+						"192.168.1.100": {
+							{
+								Action: config.ScheduleActionBlockGroups,
+								Groups: []string{"socialMedia"},
+								Schedule: []config.ScheduleWindow{
+									{
+										Start: config.TimeOfDay{Hour: 0, Minute: 0},
+										End:   config.TimeOfDay{Hour: 23, Minute: 59},
+										Days:  dayPatternEveryday(),
+									},
+								},
+							},
+						},
+					},
+				}
+			})
+
+			JustBeforeEach(func() {
+				var err error
+				m = &mockResolver{}
+				m.On("Resolve", mock.Anything).Return(&Response{Res: mockAnswer}, nil)
+
+				sut, err = NewBlockingResolver(ctx, sutConfig, parentalConfig, nil, systemResolverBootstrap)
+				Expect(err).Should(Succeed())
+				sut.Next(m)
+			})
+
+			It("should block domains in the specified groups", func() {
+				Expect(sut.Resolve(ctx, newRequestWithClient("facebook.com.", A, "192.168.1.100", "client1"))).
+					Should(And(
+						BeDNSRecord("facebook.com.", A, "0.0.0.0"),
+						HaveResponseType(ResponseTypeBLOCKED),
+					))
+			})
+
+			It("should allow domains not in the specified groups", func() {
+				Expect(sut.Resolve(ctx, newRequestWithClient("google.com.", A, "192.168.1.100", "client1"))).
+					Should(And(
+						HaveResponseType(ResponseTypeRESOLVED),
+					))
+			})
+		})
+
+		Describe("allowGroupsOnly action", func() {
+			BeforeEach(func() {
+				parentalConfig = config.ParentalControl{
+					Clients: map[string][]config.ClientSchedule{
+						"192.168.1.100": {
+							{
+								Action: config.ScheduleActionAllowGroupsOnly,
+								Groups: []string{"education"},
+								Schedule: []config.ScheduleWindow{
+									{
+										Start: config.TimeOfDay{Hour: 0, Minute: 0},
+										End:   config.TimeOfDay{Hour: 23, Minute: 59},
+										Days:  dayPatternEveryday(),
+									},
+								},
+							},
+						},
+					},
+				}
+			})
+
+			JustBeforeEach(func() {
+				var err error
+				m = &mockResolver{}
+				m.On("Resolve", mock.Anything).Return(&Response{Res: mockAnswer}, nil)
+
+				sut, err = NewBlockingResolver(ctx, sutConfig, parentalConfig, nil, systemResolverBootstrap)
+				Expect(err).Should(Succeed())
+				sut.Next(m)
+			})
+
+			It("should allow domains in the allowlist groups", func() {
+				Expect(sut.Resolve(ctx, newRequestWithClient("wikipedia.org.", A, "192.168.1.100", "client1"))).
+					Should(And(
+						HaveResponseType(ResponseTypeRESOLVED),
+					))
+			})
+
+			It("should block domains not in the allowlist groups", func() {
+				Expect(sut.Resolve(ctx, newRequestWithClient("google.com.", A, "192.168.1.100", "client1"))).
+					Should(And(
+						BeDNSRecord("google.com.", A, "0.0.0.0"),
+						HaveResponseType(ResponseTypeBLOCKED),
+						HaveReason("BLOCKED (PARENTAL CONTROL - NOT IN ALLOWLIST)"),
+					))
+			})
+		})
+
+		Describe("CIDR matching", func() {
+			BeforeEach(func() {
+				parentalConfig = config.ParentalControl{
+					Clients: map[string][]config.ClientSchedule{
+						"192.168.2.0/24": {
+							{
+								Action: config.ScheduleActionBlockAll,
+								Schedule: []config.ScheduleWindow{
+									{
+										Start: config.TimeOfDay{Hour: 0, Minute: 0},
+										End:   config.TimeOfDay{Hour: 23, Minute: 59},
+										Days:  dayPatternEveryday(),
+									},
+								},
+							},
+						},
+					},
+				}
+			})
+
+			JustBeforeEach(func() {
+				var err error
+				m = &mockResolver{}
+				m.On("Resolve", mock.Anything).Return(&Response{Res: mockAnswer}, nil)
+
+				sut, err = NewBlockingResolver(ctx, sutConfig, parentalConfig, nil, systemResolverBootstrap)
+				Expect(err).Should(Succeed())
+				sut.Next(m)
+			})
+
+			It("should block requests from IPs in the CIDR range", func() {
+				Expect(sut.Resolve(ctx, newRequestWithClient("google.com.", A, "192.168.2.50", "client1"))).
+					Should(And(
+						HaveResponseType(ResponseTypeBLOCKED),
+						HaveReason("BLOCKED (PARENTAL CONTROL)"),
+					))
+			})
+
+			It("should not block requests from IPs outside the CIDR range", func() {
+				Expect(sut.Resolve(ctx, newRequestWithClient("google.com.", A, "192.168.3.50", "client2"))).
+					Should(And(
+						HaveResponseType(ResponseTypeRESOLVED),
+					))
+			})
+		})
+
+		Describe("Schedule not active", func() {
+			BeforeEach(func() {
+				// Create a schedule that is never active (past time window)
+				parentalConfig = config.ParentalControl{
+					Clients: map[string][]config.ClientSchedule{
+						"192.168.1.100": {
+							{
+								Action: config.ScheduleActionBlockAll,
+								Schedule: []config.ScheduleWindow{
+									{
+										// Window from 03:00 to 03:01 - very unlikely to match
+										Start: config.TimeOfDay{Hour: 3, Minute: 0},
+										End:   config.TimeOfDay{Hour: 3, Minute: 1},
+										Days:  dayPatternNone(),
+									},
+								},
+							},
+						},
+					},
+				}
+			})
+
+			JustBeforeEach(func() {
+				var err error
+				m = &mockResolver{}
+				m.On("Resolve", mock.Anything).Return(&Response{Res: mockAnswer}, nil)
+
+				sut, err = NewBlockingResolver(ctx, sutConfig, parentalConfig, nil, systemResolverBootstrap)
+				Expect(err).Should(Succeed())
+				sut.Next(m)
+			})
+
+			It("should not block when schedule is not active", func() {
+				Expect(sut.Resolve(ctx, newRequestWithClient("google.com.", A, "192.168.1.100", "client1"))).
+					Should(And(
+						HaveResponseType(ResponseTypeRESOLVED),
+					))
+			})
+		})
+
+		Describe("Invalid timezone", func() {
+			It("should return error for invalid timezone", func() {
+				invalidConfig := config.ParentalControl{
+					Timezone: "Invalid/Timezone",
+					Clients: map[string][]config.ClientSchedule{
+						"192.168.1.100": {},
+					},
+				}
+				_, err := NewBlockingResolver(ctx, sutConfig, invalidConfig, nil, systemResolverBootstrap)
+				Expect(err).Should(HaveOccurred())
+				Expect(err.Error()).Should(ContainSubstring("invalid timezone"))
 			})
 		})
 	})
