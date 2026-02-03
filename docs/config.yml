@@ -441,6 +441,71 @@ dnssec:
     # Example: DS record format (for parent zone validation)
     - "subdomain.example.com. 3600 IN DS 12345 8 2 1234567890ABCDEF..."
 
+# optional: Parental control configuration
+# Allows defining time-based blocking schedules for specific clients.
+# Useful for managing internet access for children's devices, enforcing study hours,
+# or implementing bedtime restrictions.
+parentalControl:
+  # optional: Timezone for schedule evaluation
+  # Uses IANA timezone database names (e.g., "America/New_York", "Europe/Berlin")
+  # default: system timezone
+  timezone: America/New_York
+  # Client schedules: map of client identifier to list of schedules
+  # Client identifier can be: IP address, CIDR subnet, or client name (with wildcards)
+  clients:
+    # Example: Block adult and gaming sites during school hours
+    kid-laptop:
+      - action: blockGroups
+        groups:
+          - adult
+          - gaming
+        schedule:
+          - start: "08:00"
+            end: "15:00"
+            days: weekdays
+    # Example: Complete internet block during bedtime (overnight window)
+    192.168.1.100:
+      - action: blockAll
+        schedule:
+          - start: "21:00"
+            end: "07:00"
+            days: weekdays
+          - start: "22:00"
+            end: "08:00"
+            days: weekends
+    # Example: Allow only educational sites during homework time
+    # (requires corresponding allowlist group in blocking.allowlists)
+    kids-*:
+      - action: allowGroupsOnly
+        groups:
+          - educational
+        schedule:
+          - start: "16:00"
+            end: "18:00"
+            days: weekdays
+    # Example: Multiple schedules for a subnet
+    10.0.0.0/24:
+      # Block social media during work hours
+      - action: blockGroups
+        groups:
+          - social-media
+        schedule:
+          - start: "09:00"
+            end: "17:00"
+            days: weekdays
+      # Complete block during family dinner
+      - action: blockAll
+        schedule:
+          - start: "18:00"
+            end: "19:00"
+            days: everyday
+# Schedule actions:
+#   blockGroups: Add specified groups to blocking check during window
+#   blockAll: Block ALL DNS requests during window (returns NXDOMAIN)
+#   allowGroupsOnly: Only allow domains matching specified allowlist groups
+# Day patterns:
+#   everyday, weekdays, weekends, or comma-separated list (e.g., mon,wed,fri)
+
 # optional: DNS64 configuration
 # DNS64 (RFC 6147) allows IPv6-only clients to access IPv4-only services by
 # synthesizing AAAA (IPv6) records from A (IPv4) records. This is critical for

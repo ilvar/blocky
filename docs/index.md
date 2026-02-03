@@ -14,6 +14,7 @@ Blocky is a DNS proxy and ad-blocker for the local network written in Go with fo
     * Periodical reload of external allow/denylists
     * Regex support
     * Blocking of request domain, response CNAME (deep CNAME inspection) and response IP addresses (against IP lists)
+    * Parental controls with scheduled time windows (bedtime, homework hours, etc.)
 
 - **Advanced DNS configuration** - :nerd: not just an ad-blocker
 

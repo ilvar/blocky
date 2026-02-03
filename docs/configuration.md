@@ -652,6 +652,189 @@ NXDOMAIN response for the configured duration.
 
 See [Sources Loading](#sources-loading).
 
+## Parental Control
+
+Parental control allows you to define time-based blocking schedules for specific clients. This is useful for managing internet access for children's devices, enforcing study hours, or implementing bedtime restrictions.
+
+### Overview
+
+When a parental control schedule is active for a client, blocky can:
+
+- **Block additional groups**: Add specified blocking groups during the time window
+- **Block all DNS requests**: Return NXDOMAIN for ALL queries during the time window
+- **Allow only specific domains**: Only allow domains matching specified allowlist groups; block everything else
+
+### Configuration Parameters
+
+| Parameter                           | Type                                            | Mandatory | Default value  | Description                                                                 |
+| ----------------------------------- | ----------------------------------------------- | --------- | -------------- | --------------------------------------------------------------------------- |
+| parentalControl.timezone            | string                                          | no        | system default | Timezone for schedule evaluation (e.g., "America/New_York", "Europe/Berlin") |
+| parentalControl.clients             | map of client identifier to list of schedules   | yes       |                | Client schedules configuration                                               |
+
+### Client Identifiers
+
+Clients can be identified by:
+
+- **IP address**: Single IP (e.g., `192.168.1.100`)
+- **CIDR subnet**: IP range (e.g., `192.168.1.0/24`)
+- **Client name**: Device name with optional wildcards (e.g., `kid-laptop`, `kids-*`)
+
+!!! tip
+
+    Client name resolution works the same as in [Client name lookup](#client-name-lookup). You can use `*` as wildcard for any character sequence.
+
+### Schedule Configuration
+
+Each client can have multiple schedules. Each schedule has:
+
+| Parameter | Type                                              | Mandatory | Default value | Description                                                    |
+| --------- | ------------------------------------------------- | --------- | ------------- | -------------------------------------------------------------- |
+| action    | enum (blockGroups, blockAll, allowGroupsOnly)     | yes       |               | Action to take when schedule is active                          |
+| groups    | list of strings                                   | no        |               | Blocking/allowlist groups (required for blockGroups and allowGroupsOnly) |
+| schedule  | list of time windows                              | yes       |               | Time windows when this schedule is active                       |
+
+### Schedule Actions
+
+| Action          | Description                                                                                           |
+| --------------- | ----------------------------------------------------------------------------------------------------- |
+| blockGroups     | Add the specified groups to the blocking check during the time window                                  |
+| blockAll        | Block ALL DNS requests during the time window (returns NXDOMAIN)                                       |
+| allowGroupsOnly | Only allow domains matching the specified allowlist groups; block everything else                      |
+
+### Time Windows
+
+Each time window defines when the schedule is active:
+
+| Parameter | Type       | Mandatory | Description                                           |
+| --------- | ---------- | --------- | ----------------------------------------------------- |
+| start     | HH:MM      | yes       | Start time (inclusive)                                |
+| end       | HH:MM      | yes       | End time (exclusive)                                  |
+| days      | DayPattern | yes       | Days when this window is active                       |
+
+### Day Patterns
+
+Days can be specified as:
+
+| Pattern                    | Description                          | Example                  |
+| -------------------------- | ------------------------------------ | ------------------------ |
+| `everyday`                 | All days of the week                 | `everyday`               |
+| `weekdays`                 | Monday through Friday                | `weekdays`               |
+| `weekends`                 | Saturday and Sunday                  | `weekends`               |
+| Comma-separated list       | Specific days                        | `monday,wednesday,friday` |
+| Short day names            | Abbreviated day names                | `mon,wed,fri`            |
+| Array format (YAML)        | List of days                         | `[monday, wednesday]`    |
+
+!!! tip
+
+    Day names are case-insensitive. Both `Monday` and `monday` work.
+
+### Overnight Windows
+
+Time windows can span midnight. For example, a window from `22:00` to `06:00` will be active from 10 PM until 6 AM the next morning.
+
+!!! note
+
+    For overnight windows, the `days` pattern applies to the start time. A window `22:00-06:00` on `weekdays` will be active Monday 22:00 to Tuesday 06:00, Tuesday 22:00 to Wednesday 06:00, etc.
+
+### Examples
+
+!!! example "Block adult content during school hours"
+
+    ```yaml
+    parentalControl:
+      timezone: America/New_York
+      clients:
+        kid-laptop:
+          - action: blockGroups
+            groups:
+              - adult
+              - gaming
+            schedule:
+              - start: "08:00"
+                end: "15:00"
+                days: weekdays
+    ```
+
+    This blocks adult and gaming sites on `kid-laptop` during school hours (8 AM to 3 PM) on weekdays.
+
+!!! example "Complete internet block during bedtime"
+
+    ```yaml
+    parentalControl:
+      timezone: Europe/Berlin
+      clients:
+        192.168.1.100:
+          - action: blockAll
+            schedule:
+              - start: "21:00"
+                end: "07:00"
+                days: weekdays
+              - start: "22:00"
+                end: "08:00"
+                days: weekends
+    ```
+
+    This blocks ALL internet access for the device at 192.168.1.100:
+    - Weekdays: 9 PM to 7 AM
+    - Weekends: 10 PM to 8 AM
+
+!!! example "Allow only educational sites during homework time"
+
+    ```yaml
+    blocking:
+      allowlists:
+        educational:
+          - |
+            wikipedia.org
+            *.wikipedia.org
+            khanacademy.org
+            *.khanacademy.org
+            google.com
+            *.google.com
+
+    parentalControl:
+      clients:
+        kids-*:
+          - action: allowGroupsOnly
+            groups:
+              - educational
+            schedule:
+              - start: "16:00"
+                end: "18:00"
+                days: weekdays
+    ```
+
+    This allows ONLY educational sites for all devices starting with `kids-` from 4 PM to 6 PM on weekdays. All other domains will be blocked.
+
+!!! example "Multiple schedules for the same client"
+
+    ```yaml
+    parentalControl:
+      timezone: America/Los_Angeles
+      clients:
+        192.168.1.0/24:
+          # Block social media during work hours
+          - action: blockGroups
+            groups:
+              - social-media
+            schedule:
+              - start: "09:00"
+                end: "17:00"
+                days: weekdays
+          # Complete block during family dinner
+          - action: blockAll
+            schedule:
+              - start: "18:00"
+                end: "19:00"
+                days: everyday
+    ```
+
+    This applies multiple schedules to all devices in the 192.168.1.0/24 subnet.
+
+!!! warning
+
+    Parental control schedules are evaluated **before** the regular blocking configuration. If a parental control schedule is active, it takes precedence.
+
 ## Caching
 
 Each DNS response has a TTL (Time-to-live) value. This value defines, how long is the record valid in seconds. The
